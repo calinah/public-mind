@@ -2,16 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
-	"time"
 
 	"fmt"
 	"public-mind/internal/config"
@@ -20,40 +15,11 @@ import (
 	// Import to register the PostgreSQL driver, even though you don't call its functions directly.
 	_ "github.com/lib/pq"
 
-	"github.com/gin-gonic/gin"
 	"github.com/ledongthuc/pdf"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/pgvector/pgvector-go"
 )
-
-type AskRequest struct {
-	Question string `json:"question"`
-}
-
-func handleAsk(c *gin.Context) {
-	var req AskRequest
-
-	// parse and validate JSON body
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// return bad request?
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "invalid request body",
-		})
-		return
-	}
-	if req.Question == "" {
-		// handle error and send back a bad return(400)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "question is required"})
-		// stop processing the request
-		return
-	}
-	// Process the question
-	answer := "This is where you'd call the LLM to process the question"
-
-	// Respond with JSON
-	c.JSON(http.StatusOK, gin.H{"answer": answer})
-}
 
 func processAllDocuments(config *config.Config) error {
 	docsDir := "docs"
@@ -108,17 +74,24 @@ func isFileProcessed(fileName string, db *sql.DB) (bool, error) {
 	}
 	return count > 0, nil
 }
+
 func processSinglePDF(filePath string, config *config.Config) error {
 	// TODO fix this so there is no processing duplication
-	// // Check if already processed
-	// processed, err := isFileProcessed(filePath, db)
-	// if err != nil {
-	// 	return err
-	// }
-	// if processed {
-	// 	fmt.Printf("  ⏭️  Skipping (already processed): %s\n", filepath.Base(filePath))
-	// 	return nil
-	// }
+	// Create db client early so we can check if any file has already been processed and stored in db
+	db, err := sql.Open("postgres", config.Database.URL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	// Check if already processed
+	processed, err := isFileProcessed(filePath, db)
+	if err != nil {
+		return err
+	}
+	if processed {
+		fmt.Printf("  ⏭️  Skipping (already processed): %s\n", filepath.Base(filePath))
+		return nil
+	}
 	// TODO: Implement PDF processing
 	fmt.Printf("  🔍 Extracting text from %s\n", filepath.Base(filePath))
 	// Open the PDF file
@@ -153,13 +126,6 @@ func processSinglePDF(filePath string, config *config.Config) error {
 	}
 	fmt.Printf("  ✨ Generated %d embeddings\n", len(embeddings))
 	// TODO : Store in db
-	// Create db client
-	db, err := sql.Open("postgres", config.Database.URL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
 	// Ensure table exists
 	err = ensureTableExists(db)
 	if err != nil {
@@ -274,12 +240,12 @@ func generateEmbeddings(chunks []string, config *config.Config) ([][]float64, er
 }
 
 func chunkTextWithOverlap(text string, chunkSize int, overlap int) []string {
-	// 1. Split text into tokens using simple word splitting
+	// Split text into tokens using simple word splitting
 	tokens := strings.Fields(text) // Split by whitespace
 
 	var chunks []string
 
-	// 2. Create chunks with overlap
+	// Create chunks with overlap
 	for i := 0; i < len(tokens); i += chunkSize - overlap {
 		// Start of chunk
 		start := i
@@ -322,51 +288,4 @@ func main() {
 	}
 
 	fmt.Println("✅ Ingestion complete!")
-
-	// Create a Gin router with default middleware (logger and recovery)
-	r := gin.Default()
-
-	// Define a simple GET endpoint
-	r.GET("/healthz", func(c *gin.Context) {
-		// Return JSON response
-		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-		})
-	})
-
-	r.POST("/ask", handleAsk)
-
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", config.Server.Port),
-		Handler: r,
-	}
-
-	// Initializing the server in a goroutine so that
-	// it won't block the graceful shutdown handling below
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("listen: %s\n", err)
-		}
-	}()
-
-	// Wait for interrupt signal to gracefully shutdown the server with
-	// a timeout of 5 seconds.
-	quit := make(chan os.Signal)
-	// kill (no param) default send syscall.SIGTERM
-	// kill -2 is syscall.SIGINT
-	// kill -9 is syscall.SIGKILL but can't be caught, so don't need to add it
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down server...")
-
-	// The context is used to inform the server it has 5 seconds to finish
-	// the request it is currently handling
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
-	}
-
-	log.Println("Server exiting")
 }
